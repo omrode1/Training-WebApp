@@ -67,6 +67,29 @@ results/
 train_*.jpg
 val_*.jpg
 
+# Image files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.csv
+*.json
+*.txt
+*.log
+*.yaml
+*.yml
+*.jsonl
+
+# Exceptions for documentation/assets (if needed)
+!assets/*.jpg
+!assets/*.png
+!docs/*.jpg
+!docs/*.png
+
 # Streamlit specific
 .streamlit/
 streamlit_app.py.backup
