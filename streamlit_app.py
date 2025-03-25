@@ -13,7 +13,10 @@ import subprocess
 import multiprocessing
 import tempfile
 import time
+import json
+import re
 from datetime import datetime
+import plotly.express as px
 
 # Import YOLOTrainer from app.py
 from app import YOLOTrainer
@@ -139,7 +142,7 @@ def explore_directory(base_path):
         parent_dir = get_parent_directory(base_path)
         if parent_dir != base_path and os.access(parent_dir, os.R_OK):
             if st.button("📁 ..", key="parent_dir"):
-                return parent_dir
+                return parent_dir, False
         
         # List all subdirectories
         subdirs = [d for d in os.listdir(base_path) 
@@ -152,16 +155,17 @@ def explore_directory(base_path):
             with cols[i % 3]:
                 full_path = os.path.join(base_path, subdir)
                 if st.button(f"📁 {subdir}", key=f"dir_{subdir}"):
-                    return full_path
+                    return full_path, False
         
         # Option to select current directory
         if st.button("✅ Select Current Directory", key="select_current"):
-            return base_path
+            st.session_state.selected_folder = base_path
+            return base_path, True
             
-        return base_path
+        return base_path, False
     except Exception as e:
         st.error(f"Error accessing directory: {str(e)}")
-        return base_path
+        return base_path, False
 
 def explore_model_files(base_path):
     """Create a file explorer UI for selecting model files"""
@@ -248,9 +252,15 @@ def render_step_1():
                     st.session_state.current_browse_path = os.path.expanduser("~")
                 
                 # Display the directory explorer
-                new_path = explore_directory(st.session_state.current_browse_path)
+                new_path, selected = explore_directory(st.session_state.current_browse_path)
                 if new_path != st.session_state.current_browse_path:
                     st.session_state.current_browse_path = new_path
+                    st.rerun()
+                
+                # If a folder was selected, update the dataset path
+                if selected:
+                    dataset_path = st.session_state.selected_folder
+                    st.success(f"Selected folder: {dataset_path}")
                     st.rerun()
             
             st.markdown("</div>", unsafe_allow_html=True)
@@ -941,10 +951,74 @@ def run_training_cli(config, data_yaml_path):
     with open(config_path, 'w') as f:
         yaml.dump(training_config, f)
     
+    # Store the expected runs directory
+    runs_dir = os.path.join(os.getcwd(), 'runs')
+    if not os.path.exists(runs_dir):
+        os.makedirs(runs_dir, exist_ok=True)
+    
     # Build the yolo command
     yolo_cmd = f"yolo train model={config['model']} cfg={config_path}"
     
     try:
+        # Create visualization placeholders
+        stats_container = st.container()
+        with stats_container:
+            st.markdown("### Training Metrics")
+            metrics_cols = st.columns(4)
+            map_placeholder = metrics_cols[0].empty()
+            precision_placeholder = metrics_cols[1].empty()
+            recall_placeholder = metrics_cols[2].empty()
+            loss_placeholder = metrics_cols[3].empty()
+            
+            # Create progress tracking
+            progress_container = st.container()
+            with progress_container:
+                st.markdown("### Training Progress")
+                progress_cols = st.columns([4, 1])
+                with progress_cols[0]:
+                    progress_bar = st.progress(0)
+                    epoch_text = st.empty()
+                with progress_cols[1]:
+                    # Add emergency stop button
+                    if st.button("⛔ Emergency Stop", key="stop_training"):
+                        st.error("Stopping training - please wait...")
+                        try:
+                            process.terminate()
+                            # Wait a bit for graceful termination
+                            time.sleep(2)
+                            # Force kill if still running
+                            if process.poll() is None:
+                                process.kill()
+                        except:
+                            pass
+                        return False, "Training stopped by user"
+                
+                # Create charts for visualization
+                chart_cols = st.columns(2)
+                with chart_cols[0]:
+                    st.markdown("#### Loss Chart")
+                    loss_chart = st.empty()
+                with chart_cols[1]:
+                    st.markdown("#### mAP Chart")
+                    map_chart = st.empty()
+                    
+                # Add a refresh button in case UI freezes
+                with st.expander("Having UI issues?"):
+                    if st.button("Force UI Refresh", key="refresh_ui"):
+                        st.rerun()
+                    st.info("Use this button if graphs and metrics stop updating properly")
+        
+        # Set up data storage for charts
+        epochs_list = []
+        map50_list = []
+        map50_95_list = []
+        precision_list = []
+        recall_list = []
+        loss_list = []
+        box_loss_values = []
+        obj_loss_values = []
+        cls_loss_values = []
+        
         # Execute YOLO training command in a subprocess
         process = subprocess.Popen(
             yolo_cmd,
@@ -961,16 +1035,244 @@ def run_training_cli(config, data_yaml_path):
         # Accumulate output
         output_lines = []
         
+        # Parse metrics pattern
+        metrics_pattern = re.compile(r'(\d+)/(\d+)\s+.*?(\d+\.\d+).*?(\d+\.\d+).*?(\d+\.\d+).*?')
+        
         # Stream the output
+        current_epoch = 0
+        total_epochs = config['epochs']
+        training_complete = False
+        last_output_time = time.time()
+        timeout_seconds = 300  # 5 minutes timeout for no output
+        
         while True:
             output = process.stdout.readline()
             if output == '' and process.poll() is not None:
                 break
+                
             if output:
+                last_output_time = time.time()
                 output_lines.append(output.strip())
+                
                 # Show the last few lines in the output area
-                output_area.code('\n'.join(output_lines[-20:]))
-                status_area.info(f"Training in progress... (Epoch progress visible below)")
+                output_area.code('\n'.join(output_lines[-10:]))
+                
+                # Check for epoch information
+                if "Epoch" in output:
+                    try:
+                        epoch_match = re.search(r'Epoch\s+(\d+)/(\d+)', output)
+                        if epoch_match:
+                            current_epoch = int(epoch_match.group(1))
+                            total_epochs = int(epoch_match.group(2))
+                            # Update progress bar
+                            progress_bar.progress(current_epoch / total_epochs)
+                            epoch_text.markdown(f"**Current Epoch**: {current_epoch}/{total_epochs}")
+                            # Force a rerun to update UI - but not too frequently
+                            if current_epoch % 5 == 0:  # Update UI every 5 epochs
+                                st.rerun()
+                    except Exception as e:
+                        status_area.error(f"Error updating epoch information: {str(e)}")
+                        pass
+                
+                # Check for metrics information
+                if "box_loss" in output and "cls_loss" in output:
+                    try:
+                        # Extract losses with more robust pattern matching
+                        box_loss_match = re.search(r'box_loss\s*:\s*([\d\.]+)', output)
+                        obj_loss_match = re.search(r'obj_loss\s*:\s*([\d\.]+)', output)
+                        cls_loss_match = re.search(r'cls_loss\s*:\s*([\d\.]+)', output)
+                        
+                        if box_loss_match:
+                            box_loss = float(box_loss_match.group(1))
+                            
+                            # Default values if not found
+                            obj_loss = 0.0
+                            cls_loss = 0.0
+                            
+                            if obj_loss_match:
+                                obj_loss = float(obj_loss_match.group(1))
+                            if cls_loss_match:
+                                cls_loss = float(cls_loss_match.group(1))
+                            
+                            # Add to loss values
+                            box_loss_values.append(box_loss)
+                            obj_loss_values.append(obj_loss)
+                            cls_loss_values.append(cls_loss)
+                            
+                            # Calculate total loss
+                            total_loss = box_loss + obj_loss + cls_loss
+                            loss_list.append(total_loss)
+                            
+                            # Update loss display
+                            loss_placeholder.metric(
+                                "Total Loss", 
+                                f"{total_loss:.4f}", 
+                                delta=f"{total_loss - loss_list[0]:.4f}" if len(loss_list) > 1 else None,
+                                delta_color="inverse"  # Lower loss is better
+                            )
+                            
+                            # Plot loss chart
+                            if len(loss_list) > 1:
+                                fig_loss, ax_loss = plt.subplots(figsize=(8, 5))  # Larger figure size
+                                
+                                # Plot with larger line width and distinct colors
+                                ax_loss.plot(range(len(box_loss_values)), box_loss_values, label='Box Loss', 
+                                       linewidth=2, color='#1f77b4')
+                                ax_loss.plot(range(len(obj_loss_values)), obj_loss_values, label='Obj Loss', 
+                                       linewidth=2, color='#ff7f0e')
+                                ax_loss.plot(range(len(cls_loss_values)), cls_loss_values, label='Cls Loss', 
+                                       linewidth=2, color='#2ca02c')
+                                ax_loss.plot(range(len(loss_list)), loss_list, label='Total Loss', 
+                                       linewidth=3, color='#d62728', linestyle='--')
+                                
+                                # Improved appearance
+                                ax_loss.set_xlabel('Iteration', fontsize=12)
+                                ax_loss.set_ylabel('Loss Value', fontsize=12)
+                                ax_loss.tick_params(axis='both', which='major', labelsize=10)
+                                ax_loss.legend(fontsize=12, loc='upper right')
+                                ax_loss.grid(True, alpha=0.3)
+                                
+                                # Add title and adjust layout
+                                ax_loss.set_title('Training Loss Progress', fontsize=14)
+                                plt.tight_layout()
+                                
+                                # Use Streamlit's pyplot function
+                                loss_chart.pyplot(fig_loss)
+                                
+                                # Explicitly close the figure to free memory
+                                plt.close(fig_loss)
+                    except Exception as e:
+                        # Just continue if there's an error parsing metrics
+                        pass
+                
+                # Check for validation metrics
+                if "mAP@0.5" in output:
+                    try:
+                        # More robust pattern matching with better regex
+                        # Use \s* instead of \s+ to handle variable whitespace
+                        map50_match = re.search(r'mAP@0\.5\s*:\s*([\d\.]+)', output)
+                        map50_95_match = re.search(r'mAP@0\.5:0\.95\s*:\s*([\d\.]+)', output)
+                        precision_match = re.search(r'precision\s*:\s*([\d\.]+)', output)
+                        recall_match = re.search(r'recall\s*:\s*([\d\.]+)', output)
+                        
+                        # Log the full line for debugging
+                        print(f"Metrics line: {output}")
+                        
+                        # Check for valid map50 value and proceed
+                        if map50_match:
+                            map50 = float(map50_match.group(1))
+                            
+                            # Default values in case we don't find matches
+                            precision = 0.0
+                            recall = 0.0
+                            map50_95 = 0.0
+                            
+                            # Extract other metrics if available
+                            if precision_match:
+                                precision = float(precision_match.group(1))
+                            if recall_match:
+                                recall = float(recall_match.group(1))
+                            if map50_95_match:
+                                map50_95 = float(map50_95_match.group(1))
+                                
+                            # Log the extracted values for debugging
+                            print(f"Extracted: mAP@0.5={map50}, mAP@0.5:0.95={map50_95}, precision={precision}, recall={recall}")
+                            
+                            # Add to metrics lists
+                            epochs_list.append(current_epoch)
+                            map50_list.append(map50)
+                            map50_95_list.append(map50_95)
+                            precision_list.append(precision)
+                            recall_list.append(recall)
+                            
+                            # Update metrics displays with clearer formatting
+                            map_placeholder.metric(
+                                "mAP@0.5", 
+                                f"{map50:.4f}", 
+                                delta=f"{map50 - map50_list[0]:.4f}" if len(map50_list) > 1 else None,
+                                delta_color="normal"
+                            )
+                            
+                            # Add mAP50-95 metric if available
+                            if map50_95 > 0:
+                                metrics_cols = st.columns(2)
+                                metrics_cols[1].metric(
+                                    "mAP@0.5:0.95", 
+                                    f"{map50_95:.4f}", 
+                                    delta=f"{map50_95 - map50_95_list[0]:.4f}" if len(map50_95_list) > 1 else None,
+                                    delta_color="normal"
+                                )
+                            
+                            precision_placeholder.metric(
+                                "Precision", 
+                                f"{precision:.4f}", 
+                                delta=f"{precision - precision_list[0]:.4f}" if len(precision_list) > 1 else None,
+                                delta_color="normal"
+                            )
+                            
+                            recall_placeholder.metric(
+                                "Recall", 
+                                f"{recall:.4f}", 
+                                delta=f"{recall - recall_list[0]:.4f}" if len(recall_list) > 1 else None,
+                                delta_color="normal"
+                            )
+                            
+                            # Plot mAP chart
+                            if len(epochs_list) > 1:
+                                fig, ax = plt.subplots(figsize=(8, 5))  # Larger figure size
+                                
+                                # Plot with larger markers and line width
+                                ax.plot(epochs_list, map50_list, 'o-', label='mAP@0.5', linewidth=2, markersize=6)
+                                
+                                # Add mAP@0.5:0.95 line if available
+                                if map50_95 > 0 and len(map50_95_list) > 0:
+                                    ax.plot(epochs_list, map50_95_list, 'd-', label='mAP@0.5:0.95', linewidth=2, markersize=6)
+                                
+                                ax.plot(epochs_list, precision_list, 's-', label='Precision', linewidth=2, markersize=6)
+                                ax.plot(epochs_list, recall_list, '^-', label='Recall', linewidth=2, markersize=6)
+                                
+                                # Improved appearance
+                                ax.set_xlabel('Epoch', fontsize=12)
+                                ax.set_ylabel('Metric Value', fontsize=12)
+                                ax.set_ylim(0, 1)
+                                ax.tick_params(axis='both', which='major', labelsize=10)
+                                ax.legend(fontsize=12, loc='lower right')
+                                ax.grid(True, alpha=0.3)
+                                
+                                # Add title and adjust layout
+                                ax.set_title('Training Metrics Progress', fontsize=14)
+                                plt.tight_layout()
+                                
+                                # Use Streamlit's pyplot function with a clear container
+                                map_chart.pyplot(fig)
+                                
+                                # Explicitly close the figure to free memory
+                                plt.close(fig)
+                        else:
+                            print(f"Warning: mAP@0.5 mentioned in output but value not found: {output}")
+                    except Exception as e:
+                        print(f"Error parsing metrics: {str(e)}")
+                        # Just continue if there's an error parsing metrics
+                        pass
+                
+                # Check for training completion
+                if "Training complete" in output:
+                    training_complete = True
+                    progress_bar.progress(1.0)
+                    status_area.success("Training completed successfully!")
+                
+                # Update status
+                if not training_complete:
+                    status_area.info(f"Training in progress - Epoch {current_epoch}/{total_epochs}")
+            
+            # Check for timeout - if no output for 5 minutes, consider as possible hang
+            elapsed_time = time.time() - last_output_time
+            if elapsed_time > timeout_seconds:
+                status_area.warning(f"No output for {int(elapsed_time)} seconds. Training may be stuck. Consider stopping and restarting.")
+                # Don't break here, give user the choice to wait or manually stop
+            
+            # Small sleep to prevent CPU hogging
+            time.sleep(0.1)
         
         # Get return code
         return_code = process.wait()
@@ -980,6 +1282,23 @@ def run_training_cli(config, data_yaml_path):
             os.unlink(config_path)
         except:
             pass
+        
+        # Final success message if training was successful but completion wasn't detected
+        if return_code == 0 and not training_complete:
+            progress_bar.progress(1.0)
+            status_area.success("Training completed successfully!")
+            
+            # Try to find the results directory
+            results_dir = None
+            for root, dirs, files in os.walk(runs_dir):
+                for d in dirs:
+                    if d.startswith('train_'):
+                        results_dir = os.path.join(root, d)
+                        # Get the most recent one if there are multiple
+                        break
+            
+            if results_dir:
+                st.success(f"Results saved to: {results_dir}")
         
         if return_code == 0:
             return True, '\n'.join(output_lines)
@@ -1089,7 +1408,9 @@ def render_step_5():
                 # Process results
                 if success:
                     progress_placeholder.progress(100)
-                    status_text.success("Training completed successfully!")
+                    
+                    # Large, visible completion message
+                    st.success("## 🎉 Training Successfully Completed! 🎉")
                     
                     # Create folder for results
                     results_path = os.path.join(os.path.dirname(getattr(st.session_state, 'dataset_path', '.')), 
@@ -1113,7 +1434,7 @@ def render_step_5():
                             for img_path in result_files[:4]:  # Show up to 4 result images
                                 try:
                                     img = Image.open(img_path)
-                                    st.image(img, caption=os.path.basename(img_path), use_column_width=True)
+                                    st.image(img, caption=os.path.basename(img_path), use_container_width=True)
                                 except:
                                     pass
                         else:
@@ -1134,10 +1455,11 @@ def render_step_5():
                 else:
                     progress_placeholder.empty()
                     status_text.error("Training process encountered an error.")
+                    st.error("### ❌ Training Failed")
                     st.error("Training failed. See error details below:")
                     st.code(output)
                     st.session_state.training_started = False
-                    
+            
             except Exception as e:
                 st.error(f"Error during training setup: {str(e)}")
                 st.error("If you see 'signal only works in main thread' error, try the Command Line training method.")
