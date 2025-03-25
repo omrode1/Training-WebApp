@@ -2,6 +2,11 @@
 
 A comprehensive GUI application for training YOLO (You Only Look Once) object detection models with an intuitive, user-friendly interface.
 
+
+## landing page
+
+![alt text](/images/landing_page.png)
+
 ## Features
 
 - **User-friendly Interface**: Step-by-step wizard for configuring and running model training

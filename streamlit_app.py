@@ -15,11 +15,49 @@ import tempfile
 import time
 import json
 import re
+import logging
 from datetime import datetime
 import plotly.express as px
+import threading
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/yolo_trainer.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("YOLO-Trainer")
 
 # Import YOLOTrainer from app.py
 from app import YOLOTrainer
+
+# Global variables to manage training state
+_training_thread = None
+_training_stop_event = threading.Event()
+_training_state = {
+    'is_running': False,
+    'current_epoch': 0,
+    'total_epochs': 0,
+    'output_lines': []
+}
+
+# Helper function to check if training is already running
+def is_training_running():
+    """Check if there's a YOLO training process already running"""
+    try:
+        # Check for 'yolo train' in running processes
+        result = subprocess.run(
+            "ps aux | grep 'yolo train' | grep -v grep", 
+            shell=True, 
+            capture_output=True, 
+            text=True
+        )
+        return len(result.stdout.strip()) > 0
+    except Exception:
+        return False
 
 # Set page configuration
 st.set_page_config(
@@ -110,6 +148,16 @@ with st.sidebar:
             st.markdown(step)
     
     st.divider()
+    
+    # Show training status if available
+    if 'training_in_progress' in st.session_state and st.session_state.training_in_progress:
+        st.success("🔄 Training in progress")
+        if 'training_status' in st.session_state:
+            current_epoch = st.session_state.training_status.get('current_epoch', 0)
+            total_epochs = st.session_state.training_status.get('total_epochs', 0)
+            if total_epochs > 0:
+                st.progress(current_epoch / total_epochs)
+                st.text(f"Epoch: {current_epoch}/{total_epochs}")
     
     # About section
     st.markdown("<div class='sub-header'>About</div>", unsafe_allow_html=True)
@@ -974,6 +1022,17 @@ def run_training_cli(config, data_yaml_path):
             progress_container = st.container()
             with progress_container:
                 st.markdown("### Training Progress")
+                
+                # Add overall status indicator
+                status_indicator = st.empty()
+                if 'training_running' not in st.session_state:
+                    st.session_state.training_running = True
+                    status_indicator.success("✅ Training Active")
+                elif st.session_state.training_running:
+                    status_indicator.success("✅ Training Active")
+                else:
+                    status_indicator.warning("⚠️ Training Status Unknown")
+                
                 progress_cols = st.columns([4, 1])
                 with progress_cols[0]:
                     progress_bar = st.progress(0)
@@ -983,14 +1042,30 @@ def run_training_cli(config, data_yaml_path):
                     if st.button("⛔ Emergency Stop", key="stop_training"):
                         st.error("Stopping training - please wait...")
                         try:
-                            process.terminate()
-                            # Wait a bit for graceful termination
-                            time.sleep(2)
-                            # Force kill if still running
-                            if process.poll() is None:
-                                process.kill()
-                        except:
+                            # Stop training using our helper function
+                            if stop_training():
+                                st.success("Training process stopping - please wait for it to complete")
+                            else:
+                                # Try the old way as a fallback
+                                if 'training_process' in st.session_state and st.session_state.training_process:
+                                    process = st.session_state.training_process
+                                    # Try graceful termination first
+                                    process.terminate()
+                                    # Wait a bit for graceful termination
+                                    time.sleep(2)
+                                    # Force kill if still running
+                                    if process.poll() is None:
+                                        process.kill()
+                                
+                                st.session_state.training_process = None
+                                st.success("Training stopped successfully")
+                        except Exception as e:
+                            st.error(f"Error stopping training: {str(e)}")
                             pass
+                        
+                        # Set state variables to indicate training is not running
+                        st.session_state.training_in_progress = False
+                        st.session_state.training_started = False
                         return False, "Training stopped by user"
                 
                 # Create charts for visualization
@@ -1004,9 +1079,90 @@ def run_training_cli(config, data_yaml_path):
                     
                 # Add a refresh button in case UI freezes
                 with st.expander("Having UI issues?"):
-                    if st.button("Force UI Refresh", key="refresh_ui"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("Force UI Refresh", key="refresh_ui"):
+                            st.success("Refreshing UI...")
+                            # Set flag to avoid restarting training
+                            st.session_state.update_ui_only = True
+                            # Ensure training_in_progress remains set
+                            if 'training_in_progress' not in st.session_state:
+                                st.session_state.training_in_progress = True
+                            time.sleep(0.5)
+                            st.rerun()
+                    with col2:
+                        # Add auto-refresh option
+                        auto_refresh = st.checkbox("Enable Auto-Refresh", value=False, 
+                                                 help="Automatically refresh UI every 10 seconds")
+                        if auto_refresh:
+                            # Store in session state
+                            st.session_state.auto_refresh = True
+                            
+                            # Add a heartbeat counter that increments on each run
+                            if 'heartbeat' not in st.session_state:
+                                st.session_state.heartbeat = 0
+                            else:
+                                st.session_state.heartbeat += 1
+                                
+                            # Show heartbeat to user to confirm UI is refreshing
+                            st.text(f"UI Heartbeat: {st.session_state.heartbeat}")
+                            
+                            # Set a timer for auto refresh
+                            st.session_state.last_refresh = time.time()
+                            
+                            # Auto-refresh after 10 seconds
+                            if 'last_refresh' in st.session_state and time.time() - st.session_state.last_refresh > 10:
+                                # Set flag to avoid restarting training
+                                st.session_state.update_ui_only = True
+                                # Ensure training_in_progress is preserved
+                                if 'training_in_progress' not in st.session_state:
+                                    st.session_state.training_in_progress = True
+                                else:
+                                    # Make sure it's still True if it exists
+                                    st.session_state.training_in_progress = True
+                                
+                                st.session_state.last_refresh = time.time()
+                                st.rerun()
+                    st.info("Use these options if graphs and metrics stop updating properly")
+                
+                # Add debug expander
+                with st.expander("🔍 Debug Information", expanded=True):
+                    st.markdown("### Session State Debug Information")
+                    
+                    # Display critical flags and variables
+                    debug_info = {
+                        "training_in_progress": str(st.session_state.get('training_in_progress', False)),
+                        "update_ui_only": str(st.session_state.get('update_ui_only', False)),
+                        "training_started": str(st.session_state.get('training_started', False)),
+                        "current_epoch": str(st.session_state.training_status.get('current_epoch', 0) if 'training_status' in st.session_state else 0),
+                        "total_epochs": str(st.session_state.training_status.get('total_epochs', 0) if 'training_status' in st.session_state else 0),
+                        "training_process": "Running" if 'training_process' in st.session_state and st.session_state.training_process else "Not running",
+                        "last_ui_update": str(time.time() - st.session_state.get('last_ui_update', time.time())),
+                        "heartbeat": str(st.session_state.get('heartbeat', 0)),
+                        "metrics_updated": str(st.session_state.training_status.get('metrics_updated', False) if 'training_status' in st.session_state else False)
+                    }
+                    
+                    # Display as a table
+                    debug_df = pd.DataFrame(list(debug_info.items()), columns=["Variable", "Value"])
+                    st.table(debug_df)
+                    
+                    # Add forceful continue button
+                    if st.button("🔄 Force Continue Training", key="force_continue"):
+                        st.session_state.update_ui_only = True
+                        st.session_state.training_in_progress = True
+                        st.session_state.training_started = True
                         st.rerun()
-                    st.info("Use this button if graphs and metrics stop updating properly")
+                    
+                    st.markdown("### Process Output (Last 5 lines)")
+                    if 'training_status' in st.session_state and 'output_lines' in st.session_state.training_status:
+                        output_lines = st.session_state.training_status['output_lines']
+                        if output_lines:
+                            for line in output_lines[-5:]:
+                                st.text(line)
+                        else:
+                            st.info("No output captured yet")
+                    else:
+                        st.info("No training output available")
         
         # Set up data storage for charts
         epochs_list = []
@@ -1027,6 +1183,15 @@ def run_training_cli(config, data_yaml_path):
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
+        
+        # Store process in session state so it can be accessed for emergency stop
+        st.session_state.training_process = process
+        
+        # Log the command for debugging
+        print(f"Executing YOLO command: {yolo_cmd}")
+        
+        # Track in session state that training is active to prevent auto-restarts  
+        st.session_state.training_in_progress = True
         
         # Set up placeholders for real-time output
         status_area = st.empty()
@@ -1057,6 +1222,24 @@ def run_training_cli(config, data_yaml_path):
                 # Show the last few lines in the output area
                 output_area.code('\n'.join(output_lines[-10:]))
                 
+                # Add them to session state for persistence
+                st.session_state.training_status['output_lines'] = output_lines[-50:]  # Keep last 50 lines
+                
+                # Add timestamp to important log lines for better context
+                timestamped_output = f"[{datetime.now().strftime('%H:%M:%S')}] {output.strip()}"
+                
+                # Store important events in session state
+                if any(keyword in output for keyword in ["Epoch", "mAP@0.5", "Training complete"]):
+                    if 'important_events' not in st.session_state:
+                        st.session_state.important_events = []
+                    # Only keep recent important events (last 20)
+                    st.session_state.important_events = (st.session_state.important_events + [timestamped_output])[-20:]
+                    
+                    # Show important events in expander for debugging
+                    with st.expander("Training Events Log", expanded=False):
+                        for event in st.session_state.important_events:
+                            st.text(event)
+                
                 # Check for epoch information
                 if "Epoch" in output:
                     try:
@@ -1064,12 +1247,22 @@ def run_training_cli(config, data_yaml_path):
                         if epoch_match:
                             current_epoch = int(epoch_match.group(1))
                             total_epochs = int(epoch_match.group(2))
+                            
+                            # Store values in session state for persistence across reruns
+                            st.session_state.training_status['current_epoch'] = current_epoch
+                            st.session_state.training_status['total_epochs'] = total_epochs
+                            
                             # Update progress bar
-                            progress_bar.progress(current_epoch / total_epochs)
-                            epoch_text.markdown(f"**Current Epoch**: {current_epoch}/{total_epochs}")
-                            # Force a rerun to update UI - but not too frequently
-                            if current_epoch % 5 == 0:  # Update UI every 5 epochs
-                                st.rerun()
+                            progress = current_epoch / total_epochs
+                            progress_bar.progress(progress)
+                            epoch_text.markdown(f"**Current Epoch**: {current_epoch}/{total_epochs} ({int(progress*100)}%)")
+                            
+                            # Force more frequent UI updates
+                            if current_epoch % 2 == 0:  # Update UI more frequently (every 2 epochs)
+                                status_area.info(f"Training in progress - Epoch {current_epoch}/{total_epochs} ({int(progress*100)}%)")
+                                st.session_state.training_status['metrics_updated'] = True
+                                # Don't force rerun during training to avoid restarting the process
+                                # Just update the UI elements directly instead
                     except Exception as e:
                         status_area.error(f"Error updating epoch information: {str(e)}")
                         pass
@@ -1102,6 +1295,12 @@ def run_training_cli(config, data_yaml_path):
                             # Calculate total loss
                             total_loss = box_loss + obj_loss + cls_loss
                             loss_list.append(total_loss)
+                            
+                            # Store in session state for persistence
+                            st.session_state.training_status['box_loss'] = box_loss
+                            st.session_state.training_status['obj_loss'] = obj_loss
+                            st.session_state.training_status['cls_loss'] = cls_loss
+                            st.session_state.training_status['total_loss'] = total_loss
                             
                             # Update loss display
                             loss_placeholder.metric(
@@ -1177,6 +1376,13 @@ def run_training_cli(config, data_yaml_path):
                                 
                             # Log the extracted values for debugging
                             print(f"Extracted: mAP@0.5={map50}, mAP@0.5:0.95={map50_95}, precision={precision}, recall={recall}")
+                            
+                            # Store in session state for persistence across reruns
+                            st.session_state.training_status['map50'] = map50
+                            st.session_state.training_status['map50_95'] = map50_95 if map50_95 > 0 else 0.0
+                            st.session_state.training_status['precision'] = precision
+                            st.session_state.training_status['recall'] = recall
+                            st.session_state.training_status['metrics_updated'] = True
                             
                             # Add to metrics lists
                             epochs_list.append(current_epoch)
@@ -1264,12 +1470,31 @@ def run_training_cli(config, data_yaml_path):
                 # Update status
                 if not training_complete:
                     status_area.info(f"Training in progress - Epoch {current_epoch}/{total_epochs}")
+                    
+                    # Force a rerun every 10 seconds regardless of output to keep UI updated
+                    current_time = time.time()
+                    if 'last_ui_update' not in st.session_state:
+                        st.session_state.last_ui_update = current_time
+                    elif current_time - st.session_state.last_ui_update > 10:
+                        # Store a flag indicating we want to update but not restart training
+                        st.session_state.update_ui_only = True
+                        st.session_state.last_ui_update = current_time
+                        # Only rerun if training is completed or when critical
+                        if current_epoch % 10 == 0:  # Less frequent reruns (every 10 epochs)
+                            st.rerun()
             
             # Check for timeout - if no output for 5 minutes, consider as possible hang
             elapsed_time = time.time() - last_output_time
             if elapsed_time > timeout_seconds:
                 status_area.warning(f"No output for {int(elapsed_time)} seconds. Training may be stuck. Consider stopping and restarting.")
-                # Don't break here, give user the choice to wait or manually stop
+                # Create a countdown timer for auto-rerun to check if process is still alive
+                if elapsed_time % 60 < 1:  # Roughly every minute
+                    # Set flag to prevent restarting training
+                    st.session_state.update_ui_only = True
+                    # Ensure training_in_progress remains set to True
+                    if 'training_in_progress' not in st.session_state:
+                        st.session_state.training_in_progress = True
+                    st.rerun()  # Force refresh to check status
             
             # Small sleep to prevent CPU hogging
             time.sleep(0.1)
@@ -1312,6 +1537,132 @@ def run_training_cli(config, data_yaml_path):
         except:
             pass
         return False, str(e)
+
+def run_training_in_thread(config, data_yaml_path):
+    """
+    Run the YOLO training in a background thread and update global state
+    """
+    global _training_state
+    
+    # Mark training as started
+    _training_state['is_running'] = True
+    logger.info(f"Training thread started with {config['epochs']} epochs")
+    
+    try:
+        # Create a temporary YAML file with the training configuration
+        config_file = tempfile.NamedTemporaryFile(suffix='.yaml', delete=False)
+        config_path = config_file.name
+        
+        # Copy all necessary parameters to the config
+        training_config = {
+            'model': config['model'],
+            'data': data_yaml_path,
+            'epochs': config['epochs'],
+            'imgsz': config['imgsz'],
+            'batch': config['batch_size'],
+            'device': config['device'],
+            'optimizer': config['optimizer'],
+            'patience': config['patience'],
+            'lr0': config['lr0'],
+            'lrf': config['lrf'],
+            'momentum': config.get('momentum', 0.937),
+            'weight_decay': config.get('weight_decay', 0.0005),
+            'warmup_epochs': config.get('warmup_epochs', 3.0),
+            'warmup_momentum': config.get('warmup_momentum', 0.8),
+            'warmup_bias_lr': config.get('warmup_bias_lr', 0.1),
+            'project': config.get('project_name', 'runs/detect'),
+            'name': f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            'exist_ok': True,
+            'augment': True,
+            'degrees': config['degrees'],
+            'translate': config['translate'],
+            'scale': config['scale'],
+            'shear': config['shear'],
+            'perspective': config['perspective'],
+            'flipud': config['flipud'],
+            'fliplr': config['fliplr'],
+            'mosaic': config['mosaic'],
+            'mixup': config['mixup']
+        }
+        
+        # Save the config to the temporary file
+        with open(config_path, 'w') as f:
+            yaml.dump(training_config, f)
+        
+        # Build the yolo command
+        yolo_cmd = f"yolo train model={config['model']} cfg={config_path}"
+        logger.info(f"Running command: {yolo_cmd}")
+        
+        # Execute YOLO training command in a subprocess
+        process = subprocess.Popen(
+            yolo_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        
+        # Stream and process the output
+        while True:
+            # Check if we should stop
+            if _training_stop_event.is_set():
+                process.terminate()
+                break
+                
+            # Read output line
+            output = process.stdout.readline()
+            
+            # Check if process ended
+            if output == '' and process.poll() is not None:
+                break
+                
+            if output:
+                # Store the output
+                _training_state['output_lines'].append(output.strip())
+                
+                # Check for epoch information
+                if "Epoch" in output:
+                    try:
+                        epoch_match = re.search(r'Epoch\s+(\d+)/(\d+)', output)
+                        if epoch_match:
+                            current_epoch = int(epoch_match.group(1))
+                            total_epochs = int(epoch_match.group(2))
+                            _training_state['current_epoch'] = current_epoch
+                            _training_state['total_epochs'] = total_epochs
+                    except:
+                        pass
+                
+                # Limit stored output lines
+                if len(_training_state['output_lines']) > 100:
+                    _training_state['output_lines'] = _training_state['output_lines'][-100:]
+            
+            # Small sleep to prevent CPU hogging
+            time.sleep(0.1)
+        
+        # Process has completed
+        return_code = process.wait()
+        _training_state['is_running'] = False
+        
+        if return_code == 0:
+            _training_state['success'] = True
+            logger.info("Training completed successfully")
+        else:
+            _training_state['success'] = False
+            error_output = process.stderr.read()
+            _training_state['error'] = error_output
+            logger.error(f"Training failed with exit code {return_code}")
+        
+        # Clean up
+        try:
+            os.unlink(config_path)
+        except:
+            pass
+            
+    except Exception as e:
+        _training_state['is_running'] = False
+        _training_state['success'] = False
+        _training_state['error'] = str(e)
+        logger.error(f"Training thread error: {str(e)}")
 
 def render_step_5():
     """Training Step"""
@@ -1375,9 +1726,43 @@ def render_step_5():
         # Start training button
         if not st.session_state.training_started:
             if st.button("Start Training", type="primary"):
+                # Set all the necessary flags to track training state
                 st.session_state.training_started = True
                 st.session_state.training_method = training_method
-                st.rerun()
+                
+                # Set up a clean training status
+                st.session_state.training_status = {
+                    'current_epoch': 0,
+                    'total_epochs': st.session_state.trainer.config['epochs'],
+                    'map50': 0.0,
+                    'precision': 0.0,
+                    'recall': 0.0,
+                    'loss': 0.0,
+                    'output_lines': [],
+                    'metrics_updated': False
+                }
+                
+                # Log start of training process
+                logger.info("Training initialization requested")
+                
+                # If Command Line method is selected, use the new thread-based approach
+                if training_method == "Command Line (recommended)":
+                    if not is_training_running() and not _training_state['is_running']:
+                        # Start a new training process in a thread
+                        start_training(
+                            st.session_state.trainer.config,
+                            st.session_state.trainer.config['data_yaml_path']
+                        )
+                        st.session_state.training_in_progress = True
+                        st.rerun()
+                    else:
+                        # Training is already running
+                        logger.warning("Training is already in progress")
+                        st.session_state.training_in_progress = True
+                        st.rerun()
+                else:
+                    # Use the older subprocess method
+                    st.rerun()
         else:
             # Display training progress
             st.markdown("### Training Progress")
@@ -1394,72 +1779,160 @@ def render_step_5():
                     status_text.text("Setting up training environment...")
                     
                 if st.session_state.training_method == "Command Line (recommended)":
-                    success, output = run_training_cli(
-                        st.session_state.trainer.config,
-                        st.session_state.trainer.config['data_yaml_path']
-                    )
-                else:
-                    success = run_training_in_separate_process(
-                        st.session_state.trainer.config,
-                        st.session_state.trainer.config['data_yaml_path']
-                    )
-                    output = "Training completed via subprocess"
-                
-                # Process results
-                if success:
-                    progress_placeholder.progress(100)
+                    # Store the current state in session_state to maintain it across reruns
+                    if 'training_status' not in st.session_state:
+                        st.session_state.training_status = {
+                            'current_epoch': 0,
+                            'total_epochs': st.session_state.trainer.config['epochs'],
+                            'map50': 0.0,
+                            'precision': 0.0,
+                            'recall': 0.0,
+                            'loss': 0.0,
+                            'output_lines': [],
+                            'metrics_updated': False
+                        }
                     
-                    # Large, visible completion message
-                    st.success("## 🎉 Training Successfully Completed! 🎉")
-                    
-                    # Create folder for results
-                    results_path = os.path.join(os.path.dirname(getattr(st.session_state, 'dataset_path', '.')), 
-                                              st.session_state.trainer.config['project_name'])
-                    
-                    # Show results
-                    st.markdown("### Training Results")
-                    
-                    if os.path.exists(results_path):
-                        st.success(f"Model results saved to: {results_path}")
+                    # Check if we're just refreshing the UI or actually starting training
+                    if 'update_ui_only' in st.session_state and st.session_state.update_ui_only:
+                        # Just update UI elements with current status
+                        logger.info("UI-only update detected, preserving training state")
+                        st.session_state.update_ui_only = False  # Reset flag
                         
-                        # Try to find result graphs
-                        result_files = []
-                        for root, dirs, files in os.walk(results_path):
-                            for file in files:
-                                if file.endswith(('.png', '.jpg')) and ('results' in file or 'PR_curve' in file or 'confusion_matrix' in file):
-                                    result_files.append(os.path.join(root, file))
+                        # Get current status from global state
+                        status = get_training_status()
+                        if status['is_running']:
+                            current_epoch = status['current_epoch']
+                            total_epochs = status['total_epochs']
+                            progress = current_epoch / total_epochs if total_epochs > 0 else 0
+                            progress_bar.progress(progress)
+                            status_text.info(f"Training in progress - Epoch {current_epoch}/{total_epochs} ({int(progress*100)}%)")
+                            
+                            # Update session state with latest status
+                            st.session_state.training_status['current_epoch'] = current_epoch
+                            st.session_state.training_status['total_epochs'] = total_epochs
+                            st.session_state.training_status['output_lines'] = status['output_lines'][-50:]
+                    elif 'training_in_progress' in st.session_state and st.session_state.training_in_progress:
+                        # Training is already in progress, just update the UI with current status
+                        logger.info("Training already in progress, updating UI from global state")
                         
-                        if result_files:
-                            st.markdown("#### Performance Graphs")
-                            for img_path in result_files[:4]:  # Show up to 4 result images
-                                try:
-                                    img = Image.open(img_path)
-                                    st.image(img, caption=os.path.basename(img_path), use_container_width=True)
-                                except:
-                                    pass
+                        # Get current status from global state
+                        status = get_training_status()
+                        if status['is_running']:
+                            current_epoch = status['current_epoch']
+                            total_epochs = status['total_epochs']
+                            progress = current_epoch / total_epochs if total_epochs > 0 else 0
+                            progress_bar.progress(progress)
+                            status_text.info(f"Training in progress - Epoch {current_epoch}/{total_epochs} ({int(progress*100)}%)")
+                            
+                            # Show last 10 lines of output
+                            if status['output_lines']:
+                                output_area.code('\n'.join(status['output_lines'][-10:]))
+                                
+                            # Update session state with latest status
+                            st.session_state.training_status['current_epoch'] = current_epoch
+                            st.session_state.training_status['total_epochs'] = total_epochs
+                            st.session_state.training_status['output_lines'] = status['output_lines'][-50:]
+                            
+                            # Rerun every 10 seconds to keep UI updated
+                            if 'last_ui_update' not in st.session_state:
+                                st.session_state.last_ui_update = time.time()
+                            elif time.time() - st.session_state.last_ui_update > 10:
+                                st.session_state.update_ui_only = True
+                                st.session_state.last_ui_update = time.time()
+                                time.sleep(0.5)
+                                st.rerun()
                         else:
-                            st.warning("No result graphs found. Check the results directory manually.")
-                    else:
-                        st.warning(f"Results directory not found at {results_path}")
+                            # Training has stopped
+                            if 'success' in status and status['success']:
+                                # Training completed successfully
+                                st.session_state.training_in_progress = False
+                                st.session_state.training_complete = True
+                                st.rerun()
+                            else:
+                                # Training failed
+                                st.session_state.training_in_progress = False
+                                st.session_state.training_failed = True
+                                if 'error' in status:
+                                    st.session_state.training_output = status['error']
+                                st.rerun()
+                    elif 'training_complete' in st.session_state and st.session_state.training_complete:
+                        # Training has completed, show results
+                        logger.info("Showing completed training results")
+                        progress_placeholder.progress(1.0)
+                        status_text.success("Training completed successfully!")
                         
-                    # Show performance metrics
-                    st.markdown(
-                        """
-                        #### Performance Metrics
-                        - Mean Average Precision (mAP)
-                        - Precision-Recall curves
-                        - Confusion matrix
-                        - Inference speed
-                        """
-                    )
+                        # Large, visible completion message
+                        st.success("## 🎉 Training Successfully Completed! 🎉")
+                        
+                        # Display results
+                        # Create folder for results
+                        results_path = os.path.join(os.path.dirname(getattr(st.session_state, 'dataset_path', '.')), 
+                                                  st.session_state.trainer.config['project_name'])
+                        
+                        # Show results
+                        st.markdown("### Training Results")
+                        
+                        if os.path.exists(results_path):
+                            st.success(f"Model results saved to: {results_path}")
+                            
+                            # Try to find result graphs
+                            result_files = []
+                            for root, dirs, files in os.walk(results_path):
+                                for file in files:
+                                    if file.endswith(('.png', '.jpg')) and ('results' in file or 'PR_curve' in file or 'confusion_matrix' in file):
+                                        result_files.append(os.path.join(root, file))
+                            
+                            if result_files:
+                                st.markdown("#### Performance Graphs")
+                                for img_path in result_files[:4]:  # Show up to 4 result images
+                                    try:
+                                        img = Image.open(img_path)
+                                        st.image(img, caption=os.path.basename(img_path), use_container_width=True)
+                                    except Exception as e:
+                                        st.warning(f"Could not load image {os.path.basename(img_path)}: {str(e)}")
+                            else:
+                                st.warning("No result graphs found. Check the results directory manually.")
+                        else:
+                            st.warning(f"Results directory not found at {results_path}")
+                            
+                        # Show performance metrics
+                        st.markdown(
+                            """
+                            #### Performance Metrics
+                            - Mean Average Precision (mAP)
+                            - Precision-Recall curves
+                            - Confusion matrix
+                            - Inference speed
+                            """
+                        )
+                    elif 'training_failed' in st.session_state and st.session_state.training_failed:
+                        # Show error if training failed
+                        progress_placeholder.empty()
+                        status_text.error("Training process encountered an error.")
+                        st.error("### ❌ Training Failed")
+                        st.error("Training failed. See error details below:")
+                        if 'training_output' in st.session_state:
+                            st.code(st.session_state.training_output)
+                        st.session_state.training_started = False
+                
                 else:
-                    progress_placeholder.empty()
-                    status_text.error("Training process encountered an error.")
-                    st.error("### ❌ Training Failed")
-                    st.error("Training failed. See error details below:")
-                    st.code(output)
-                    st.session_state.training_started = False
-            
+                    # For subprocess method, notify user it won't show real-time updates
+                    status_text.warning("Note: Subprocess method doesn't support real-time updates. Consider using Command Line method.")
+                    
+                    # Only start subprocess if not already running
+                    if 'subprocess_running' not in st.session_state or not st.session_state.subprocess_running:
+                        st.session_state.subprocess_running = True
+                        success, output = run_training_cli(
+                            st.session_state.trainer.config,
+                            st.session_state.trainer.config['data_yaml_path']
+                        )
+                        st.session_state.subprocess_running = False
+                        output_area.code(output)
+                    else:
+                        status_text.info("Subprocess training is in progress...")
+                        success = False
+                        output = "Waiting for subprocess to complete..."
+                
             except Exception as e:
                 st.error(f"Error during training setup: {str(e)}")
                 st.error("If you see 'signal only works in main thread' error, try the Command Line training method.")
@@ -1509,6 +1982,57 @@ def render_step_5():
             if st.button("Previous: Augmentation"):
                 st.session_state.current_step = 4
                 st.rerun()
+
+# Function to start training
+def start_training(config, data_yaml_path):
+    """
+    Start the training process in a background thread
+    """
+    global _training_thread, _training_stop_event, _training_state
+    
+    # Reset state
+    _training_state = {
+        'is_running': False,
+        'current_epoch': 0,
+        'total_epochs': config['epochs'],
+        'output_lines': []
+    }
+    
+    # Reset stop event
+    _training_stop_event.clear()
+    
+    # Start training in a thread
+    _training_thread = threading.Thread(
+        target=run_training_in_thread,
+        args=(config, data_yaml_path)
+    )
+    _training_thread.daemon = True
+    _training_thread.start()
+    
+    # Return immediately
+    return True
+
+# Function to stop training
+def stop_training():
+    """
+    Signal the training thread to stop
+    """
+    global _training_stop_event
+    
+    if _training_thread and _training_thread.is_alive():
+        _training_stop_event.set()
+        return True
+    return False
+
+# Function to get training status
+def get_training_status():
+    """
+    Get the current training status
+    """
+    global _training_state
+    
+    # Create a copy to avoid threading issues
+    return dict(_training_state)
 
 # Render the appropriate step based on the current state
 if st.session_state.current_step == 1:
