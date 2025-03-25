@@ -53,7 +53,8 @@ events.out.tfevents.*
 models/
 
 # Dataset and training files
-Yolo_Training/
+
+/Yolo_Training
 data/
 dataset/
 datasets/
@@ -70,7 +71,7 @@ val_*.jpg
 # Image files
 *.jpg
 *.jpeg
-*.png
+
 *.gif
 *.bmp
 *.tif
@@ -123,3 +124,4 @@ logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+YOLO_Training/
